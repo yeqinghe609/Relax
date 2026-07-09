@@ -18,7 +18,6 @@ from relax.utils import try_import_telemetry_hook
 try_import_telemetry_hook()
 
 from relax.core.controller import Controller  # noqa: E402
-from relax.utils import telemetry  # noqa: E402
 from relax.utils.arguments import parse_args  # noqa: E402
 from relax.utils.logging_utils import get_logger  # noqa: E402
 from relax.utils.tracking_utils import init_tracking  # noqa: E402
@@ -88,7 +87,6 @@ def main(args):
         runtime_env = yaml.safe_load(file)
 
     runtime_env = post_process_env(args, runtime_env)
-    init_tracking(args)
     if not ray.is_initialized():
         # this is for local ray cluster
         ray.init(runtime_env=runtime_env)
@@ -101,6 +99,11 @@ def main(args):
         except RuntimeError:
             pass
 
+    # init_tracking must run after serve.start() (metrics adapter probes Ray
+    # Serve for the /metrics endpoint) and before Controller() (wandb primary
+    # writes wandb_run_id into args, which then propagates to remote actors).
+    init_tracking(args)
+
     ctrl = Controller(args, runtime_env)
     _ctrl = ctrl
 
@@ -112,11 +115,9 @@ def main(args):
     try:
         ctrl.training_loop()
     except Exception as e:
-        telemetry.mark_end(status="failed", error_type=type(e).__name__, error_message=str(e))
         logger.exception(f"Training loop failed with error: {e}")
         _graceful_shutdown(exit_code=1)
 
-    telemetry.mark_end(status="success")
     logger.info("Main func successfully")
     # Gracefully shut down SGLang engine processes before tearing down Ray Serve.
     _graceful_shutdown(exit_code=0)
@@ -124,5 +125,4 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    telemetry.mark_start(fields=vars(args))
     main(args)

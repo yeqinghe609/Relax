@@ -1710,6 +1710,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=3,
                 help="Number of consecutive failures before marking a worker as unhealthy.",
             )
+            parser.add_argument(
+                "--slime-router-sticky",
+                action="store_true",
+                default=False,
+                help="Enable sticky-session routing in SlimeRouter: pin a routing key (read from the "
+                "X-SMG-Routing-Key header) to a worker so repeated requests for the same key reuse that "
+                "worker's prefix/KV cache. Keyless requests and the initial pin fall back to least-load "
+                "selection; a live pin is never redistributed (only remapped when its worker leaves the "
+                "healthy set). Has no effect unless --use-slime-router is set.",
+            )
+            parser.add_argument(
+                "--slime-router-sticky-idle-secs",
+                type=float,
+                default=600.0,
+                help="Evict a sticky routing-key -> worker assignment after it has been idle (not routed to) "
+                "for this many seconds, bounding the map against unbounded routing-key cardinality. Scanned on "
+                "the SlimeRouter health-check cadence. Requires --slime-router-sticky.",
+            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
@@ -1788,7 +1806,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # tensorboard
         def add_tensorboard_arguments(parser):
             # tb_project_name, tb_experiment_name
-            parser.add_argument("--use-tensorboard", action="store_true", default=False)
+            parser.add_argument("--use-tensorboard", action=argparse.BooleanOptionalAction, default=True)
             parser.add_argument(
                 "--tb-project-name",
                 type=str,
@@ -2000,6 +2018,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Path to the custom function that will post process reward, by default it will be the normalization for grpo. "
+                ),
+            )
+            parser.add_argument(
+                "--defer-reward-to-post-process",
+                action="store_true",
+                default=False,
+                help=(
+                    "When set, actor.update_weights will NOT re-onload GenRM at the end of "
+                    "weight sync. Use this with --rm-type dummy + --custom-reward-post-process-path "
+                    "when the post-process function manages GenRM sleep/wake itself (shared-bundles "
+                    "colocate: rollout owns all GPUs during generate, GenRM owns them during scoring)."
                 ),
             )
             parser.add_argument(
@@ -2661,6 +2690,10 @@ def slime_validate_args(args):
             assert not args.opd_type == "megatron", (
                 "On-policy distillation with megatron teacher is not supported in fully-async mode (--fully-async)."
                 " Please set --opd-type to sglang or remove --use-opd."
+            )
+            assert not args.use_dynamic_global_batch_size, (
+                "--use-dynamic-global-batch-size is only supported in colocate mode. "
+                "fully-async training does not support dynamic global batch size yet."
             )
 
         # Auto-enable true_on_policy_mode when the per-step rollout output exactly fills

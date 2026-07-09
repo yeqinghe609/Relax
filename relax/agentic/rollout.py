@@ -126,7 +126,7 @@ def _shutdown_resident_pipeline_after_deferred_eval(rollout_id: int) -> None:
 
 
 class RolloutProgress:
-    def __init__(self, *, total_sessions: int) -> None:
+    def __init__(self, *, total_sessions: int, rollout_id: int) -> None:
         if total_sessions <= 0:
             raise RuntimeError(f"RolloutProgress requires a positive total_sessions, got {total_sessions}.")
         self.total_sessions = total_sessions
@@ -135,7 +135,7 @@ class RolloutProgress:
         self._scored_samples = 0
         self._bar = tqdm(
             total=self.total_sessions,
-            desc="Rollout generation",
+            desc=f"Rollout {rollout_id} generation",
             unit="session",
             disable=False,
             mininterval=0.0,
@@ -599,7 +599,8 @@ class AgenticResidentPipeline:
             await runtime_domain.release_partial_resume_gate()
             transfer_start_snapshot = transfer_domain.accounting_snapshot()
         progress = RolloutProgress(
-            total_sessions=transfer_domain.target_group_count() * transfer_start_snapshot["group_size"]
+            total_sessions=transfer_domain.target_group_count() * transfer_start_snapshot["group_size"],
+            rollout_id=rollout_id,
         )
         step_handle = _AgenticStepHandle(
             rollout_id=rollout_id,
@@ -1210,6 +1211,11 @@ def _aggregate_rollout_timing_from_agentic_trace(
 ) -> dict[str, float]:
     generate_values: list[float] = []
     post_generate_values: list[float] = []
+    phase_values: dict[str, list[float]] = {
+        "process_vision_info": [],
+        "image_processor": [],
+        "mm_encode": [],
+    }
     for sample in samples:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         agentic_trace = metadata.get(TRACE_KEY)
@@ -1223,6 +1229,7 @@ def _aggregate_rollout_timing_from_agentic_trace(
                 continue
             generation_elapsed_s = turn.get("generation_elapsed_s")
             wall_elapsed_s = turn.get("wall_elapsed_s")
+            events = turn.get("events")
             if isinstance(generation_elapsed_s, (int, float)):
                 generate_values.append(float(generation_elapsed_s))
             if (
@@ -1231,8 +1238,22 @@ def _aggregate_rollout_timing_from_agentic_trace(
                 and wall_elapsed_s >= generation_elapsed_s
             ):
                 post_generate_values.append(float(wall_elapsed_s) - float(generation_elapsed_s))
+            if not isinstance(events, dict):
+                continue
+            for event_key, phase in (
+                ("process_vision_info_elapsed_s", "process_vision_info"),
+                ("processor_elapsed_s", "image_processor"),
+                ("media_encode_elapsed_s", "mm_encode"),
+            ):
+                value = events.get(event_key)
+                if isinstance(value, (int, float)):
+                    phase_values[phase].append(float(value))
 
     metrics: dict[str, float] = {}
+    for phase, values in phase_values.items():
+        if values:
+            metrics[f"perf_detail/rollout/{phase}_time/mean"] = sum(values) / len(values)
+            metrics[f"perf_detail/rollout/{phase}_time/max"] = max(values)
     if generate_values:
         metrics["perf_detail/rollout/generate_time/mean"] = sum(generate_values) / len(generate_values)
         metrics["perf_detail/rollout/generate_time/max"] = max(generate_values)
@@ -1295,14 +1316,31 @@ def _compute_reward_cat_metrics(args, all_samples: list[Sample]) -> dict[str, fl
     }
 
 
+def _compute_prefix_cache_metrics(args, samples: list[Sample]) -> dict[str, float]:
+    num_samples = len(samples)
+    if num_samples == 0:
+        return {}
+    total_cached_tokens = sum(sample.prefix_cache_info.cached_tokens for sample in samples)
+    total_prompt_tokens = sum(sample.prefix_cache_info.total_prompt_tokens for sample in samples)
+    return {
+        "prefix_cache_hit_rate": (total_cached_tokens / total_prompt_tokens if total_prompt_tokens > 0 else 0.0),
+        "avg_cached_tokens_per_sample": total_cached_tokens / num_samples,
+    }
+
+
 def _compute_rollout_metrics_from_samples(args, samples: list[Sample]) -> dict[str, float]:
     response_lengths = [sample.effective_response_length for sample in samples]
     log_dict: dict[str, float] = {}
     log_dict |= _dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([has_repetition(sample.response) for sample in samples]).item()
     log_dict["truncated_ratio"] = np.mean([sample.status == Sample.Status.TRUNCATED for sample in samples]).item()
+    turns = [s.metadata.get("agentic_trace", {}).get("turn_count", 1) for s in samples]
+    log_dict["num_turn/mean"] = float(np.mean(turns))
+    log_dict["num_turn/max"] = float(np.max(turns))
+    log_dict["num_turn/min"] = float(np.min(turns))
     return log_dict
 
 
@@ -1484,15 +1522,25 @@ async def _run_eval_samples(
         eval_prepare_groups = [[sample] for sample in eval_samples]
     total_group_count = len(eval_prepare_groups)
     eval_group_size = dataset_cfg.n_samples_per_eval_prompt if args.group_rm else 1
+    train_prepare_pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
+    train_prepare_pool_target_session_count = train_prepare_pool_target_group_count * args.n_samples_per_prompt
     eval_prepare_pool_target_group_count = args.agentic_eval_prepare_pool_size
     if eval_prepare_pool_target_group_count is None:
-        train_prepare_pool_target_group_count = args.agentic_prepare_pool_size or args.over_sampling_batch_size
-        train_prepare_pool_target_session_count = train_prepare_pool_target_group_count * args.n_samples_per_prompt
         eval_prepare_pool_target_group_count = (
             train_prepare_pool_target_session_count + eval_group_size - 1
         ) // eval_group_size
     eval_prepare_pool_target_group_count = min(total_group_count, eval_prepare_pool_target_group_count)
-    eval_runtime_admission_group_count = total_group_count
+    # Cap runtime residency to training's steady-state in-flight session budget.
+    # Leaving it at total_group_count lets the whole eval set queue in runtime and
+    # can OOM the raylet on large eval datasets; training never hits this because
+    # `over_sampling_batch_size` bounds admission per step.
+    eval_runtime_admission_group_count = min(
+        total_group_count,
+        max(
+            eval_prepare_pool_target_group_count,
+            (train_prepare_pool_target_session_count + eval_group_size - 1) // eval_group_size,
+        ),
+    )
     pbar = tqdm(total=eval_sample_count, desc=f"Eval {dataset_cfg.name}", unit="sample")
     logger.info(
         "Agentic eval dataset=%s total_samples=%s total_group_count=%s "

@@ -46,11 +46,10 @@ from relax.agentic.session.state import (
     FinalizedResultTransport,
     TrainingFieldArtifact,
     check_messages,
-    normalize_template_kwargs,
-    normalize_tools,
 )
 from relax.utils.http_utils import post
 from relax.utils.logging_utils import get_logger
+from relax.utils.multimodal.config import MultimodalConfig
 from relax.utils.types import Sample
 
 
@@ -167,7 +166,14 @@ class SessionOutput:
             raise TypeError(f"SessionOutput payload must be a JSON object, got {type(payload)}")
         unknown_keys = set(payload) - {"metadata", "reward"}
         if unknown_keys:
-            raise TypeError("SessionOutput only supports 'metadata' and 'reward'")
+            # Be lenient: example agents often want to dump debug fields
+            # (messages, branch_counts, trajectory…). Warn once per call
+            # instead of crashing the whole session.
+            logger.warning(
+                "SessionOutput ignoring unknown top-level keys: %s. "
+                "Only 'metadata' and 'reward' are consumed by Relax.",
+                sorted(unknown_keys),
+            )
         metadata = payload.get("metadata", {})
         reward = payload.get("reward")
         if not isinstance(metadata, dict):
@@ -716,6 +722,51 @@ class ManagedSessionRunner:
             if (task := self._tasks_by_handle.get(session_handle)) is not None and task.done()
         ]
 
+    async def completed_session_diagnostics(self, *, session_handles: list[str]) -> dict[str, dict[str, Any]]:
+        """Peek the result/exception of each completed task without consuming
+        it.
+
+        Returns a dict mapping session_handle -> diagnostic payload. The diagnostic
+        payload distinguishes:
+          - ``{"kind": "exception", "error_type": str, "message": str}`` — task
+            raised; for AgentExecutionError the ``message`` carries the agent
+            subprocess's exit code AND full stdout+stderr (see
+            ``execute_managed_session_input`` line ~346).
+          - ``{"kind": "cancelled"}`` — task was cancelled (e.g. shutdown).
+          - ``{"kind": "result", "session_id": str, "reward": Any}`` — task
+            returned a result payload but never produced a chat IR upstream
+            (the genuine "silent-success" case: agent exited 0 without doing work).
+
+        Tasks that are missing from tracking or not yet done are omitted so this
+        is safe to call with the full set of group handles. Does NOT consume the
+        task — other layers (materialization, release_sessions) can still process
+        it normally.
+        """
+        result: dict[str, dict[str, Any]] = {}
+        for handle in session_handles:
+            task = self._tasks_by_handle.get(handle)
+            if task is None or not task.done():
+                continue
+            if task.cancelled():
+                result[handle] = {"kind": "cancelled"}
+                continue
+            exc = task.exception()
+            if exc is not None:
+                result[handle] = {
+                    "kind": "exception",
+                    "error_type": type(exc).__name__,
+                    "message": str(exc),
+                }
+                continue
+            payload = task.result()
+            reward = payload.get("reward") if isinstance(payload, dict) else None
+            result[handle] = {
+                "kind": "result",
+                "session_id": self._session_id_by_handle.get(handle, ""),
+                "reward": reward,
+            }
+        return result
+
     async def collect_session(self, *, session_handle: str) -> dict[str, Any]:
         task = self._tasks_by_handle.get(session_handle)
         if task is None:
@@ -735,9 +786,15 @@ class ManagedSessionRunner:
             if session_handle in seen_handles:
                 continue
             if session_handle not in self._tasks_by_handle:
-                raise KeyError(f"Unknown managed session handle: {session_handle}")
+                # Handle can legitimately be missing if the runner actor was
+                # respawned (e.g. after OOM kill) between session start and
+                # release; treat cleanup of a dead session as a no-op.
+                logger.warning("release_sessions: unknown managed session handle %s; skipping", session_handle)
+                continue
             seen_handles.add(session_handle)
             unique_handles.append(session_handle)
+        if not unique_handles:
+            return 0
         tasks = [self._tasks_by_handle[session_handle] for session_handle in unique_handles]
         for session_handle in unique_handles:
             self._clear_session_timeout_clock(session_handle)
@@ -888,6 +945,47 @@ class ManagedSessionRunnerPool:
             for session_handle in completed_session_handles:
                 completed_handles.append(ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle)))
         return completed_handles
+
+    def completed_session_diagnostics(
+        self, *, session_handles: list[ManagedSessionHandle]
+    ) -> dict[ManagedSessionHandle, dict[str, Any]]:
+        """Fan out to each runner and collect diagnostic info for every handle
+        whose task has finished.
+
+        See ``ManagedSessionRunner.completed_session_diagnostics`` for the per-
+        handle payload schema. Used by RuntimeDomain when raising the
+        ``completed before producing a chat IR`` error so the driver log can
+        show the agent's actual exit reason (AgentExecutionError stdio for
+        subprocess crashes, ``kind=result`` for true silent-success bugs)
+        instead of only a list of session_ids.
+        """
+        if not session_handles:
+            return {}
+        handles_by_runner_id: dict[int, list[str]] = {}
+        for handle in session_handles:
+            if handle.runner_id < 0 or handle.runner_id >= len(self._handles):
+                raise RuntimeError(
+                    "Managed session handle references an unknown runner: "
+                    f"runner_id={handle.runner_id}, runner_count={len(self._handles)}."
+                )
+            handles_by_runner_id.setdefault(handle.runner_id, []).append(handle.session_handle)
+        refs = []
+        ref_to_runner_id: dict[Any, int] = {}
+        for runner_id in sorted(handles_by_runner_id):
+            ref = self._handles[runner_id].completed_session_diagnostics.remote(
+                session_handles=handles_by_runner_id[runner_id]
+            )
+            refs.append(ref)
+            ref_to_runner_id[ref] = runner_id
+        diagnostics: dict[ManagedSessionHandle, dict[str, Any]] = {}
+        for ref, partial in zip(refs, ray.get(refs), strict=True):
+            runner_id = ref_to_runner_id[ref]
+            if not isinstance(partial, dict):
+                continue
+            for session_handle_str, diag in partial.items():
+                key = ManagedSessionHandle(runner_id=runner_id, session_handle=str(session_handle_str))
+                diagnostics[key] = diag
+        return diagnostics
 
     def available_launch_slots(self) -> int:
         available_launch_slots = self._total_capacity - self._active_session_count - self._reserved_launch_slots
@@ -1155,9 +1253,8 @@ def _transport_image_payload(payload: Any) -> str:
 
 
 def _transport_dataset_message_media(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    normalized_messages = check_messages(messages)
     rendered_messages: list[dict[str, Any]] = []
-    for message in normalized_messages:
+    for message in messages:
         content = message["content"]
         if isinstance(content, str):
             rendered_messages.append(message)
@@ -1689,11 +1786,16 @@ class RuntimeDomain:
                     if cause is not None:
                         session_local_failure_type = type(cause).__name__
                 if session_local_failure:
-                    logger.info(
-                        "Dropping failed resident agentic session session_id=%s request_id=%s error_type=%s",
+                    # ERROR-level + full message: AgentExecutionError carries the agent
+                    # subprocess's stdout+stderr (runtime.py:340-342), so dumping str(error)
+                    # surfaces the actual Python traceback from the agent in the training log,
+                    # instead of just a one-line "Dropping ..." that hides every retry's cause.
+                    logger.error(
+                        "Dropping failed resident agentic session session_id=%s request_id=%s error_type=%s\n%s",
                         materialized_record.session_id,
                         materialized_record.request_id,
                         session_local_failure_type,
+                        str(materialized_record.error),
                     )
                     discarded_group_keys.add(materialized_record.group_key)
                     await self._drop_runtime_group_resources(group_key=materialized_record.group_key)
@@ -2060,14 +2162,66 @@ class RuntimeDomain:
         total_sessions: int,
         ready_sessions: int,
     ) -> None:
-        completed_requests = self.prepare_group_completed_before_ready(group_state=group_state)
-        if not completed_requests:
+        if not group_state.request_handles:
             return
+        runner_pool = self._session_runner_pool
+        if runner_pool is None:
+            raise RuntimeError("RuntimeDomain cannot validate prepare-owned managed sessions without a runner pool.")
+        # Build the (managed_handle -> session_id, request_id) mapping inline so
+        # we can both detect "task done" AND look up its actual result/exception
+        # in a single runner round-trip. Otherwise we'd race the materialization
+        # layer's AgentExecutionError logger (runtime.py:~1755), which never
+        # gets to run because this raise kills the rollout dataflow loop first.
+        handle_to_request: dict[ManagedSessionHandle, tuple[str, str]] = {}
+        for request_handle in group_state.request_handles:
+            managed_handle = request_handle.managed_session_handle
+            if not isinstance(managed_handle, ManagedSessionHandle):
+                raise RuntimeError(
+                    "Prepare-owned request is missing a managed session handle; "
+                    f"group_id={group_state.group_id} slot_idx={request_handle.slot_idx}."
+                )
+            try:
+                envelope = group_state.request_group[request_handle.slot_idx]
+            except IndexError as exc:
+                raise RuntimeError(
+                    f"Prepare group {group_state.group_id} has inconsistent slot indexing "
+                    f"at slot={request_handle.slot_idx}."
+                ) from exc
+            handle_to_request[managed_handle] = (envelope.session_id, envelope.request_id)
+        diagnostics = runner_pool.completed_session_diagnostics(session_handles=list(handle_to_request))
+        if not diagnostics:
+            return
+        error_sections: list[str] = []
+        for managed_handle, diag in diagnostics.items():
+            session_id, request_id = handle_to_request[managed_handle]
+            kind = diag.get("kind") if isinstance(diag, dict) else None
+            if kind == "exception":
+                # AgentExecutionError.message already carries
+                # "Managed command agent exited with code N\n<combined stdout+stderr>"
+                # (see execute_managed_session_input). Dumping it here gives the
+                # actual agent failure (e.g. concurrent pip race, import error,
+                # SIF startup failure) in the driver log.
+                error_sections.append(
+                    f"\n--- session {session_id} (request {request_id}) failed: "
+                    f"{diag.get('error_type', 'Exception')} ---\n"
+                    f"{diag.get('message', '')}"
+                )
+            elif kind == "cancelled":
+                error_sections.append(f"\n--- session {session_id} (request {request_id}) cancelled ---")
+            else:
+                # Genuine silent-success: task returned a payload but never
+                # produced a chat IR upstream. Likely an agent bug that exited
+                # 0 before making any chat completion call.
+                reward = diag.get("reward") if isinstance(diag, dict) else None
+                error_sections.append(
+                    f"\n--- session {session_id} (request {request_id}) silent-success "
+                    f"(exit 0, no chat IR, reward={reward!r}) ---"
+                )
         raise RuntimeError(
             "Prepare-owned managed agent session completed before producing a chat IR: "
             f"group_id={group_state.group_id}, group_generation={group_state.group_generation}, "
             f"expected_sessions={len(group_state.request_handles)}, total_sessions={total_sessions}, "
-            f"ready_sessions={ready_sessions}, completed_requests={completed_requests[:8]}."
+            f"ready_sessions={ready_sessions}, completed_session_count={len(diagnostics)}." + "".join(error_sections)
         )
 
     async def activate_group_sessions(
@@ -3072,46 +3226,34 @@ def _processing_utils():
     return processing_utils
 
 
-def _normalize_multimodal_inputs_sync(multimodal_inputs: dict[str, Any] | None) -> dict[str, Any] | None:
+def _normalize_multimodal_inputs_sync(
+    multimodal_inputs: dict[str, Any] | None,
+    processor: Any,
+    use_audio_in_video: bool,
+    multimodal_config: Any | None = None,
+) -> tuple[dict[str, Any] | None, dict[str, float]]:
     if not multimodal_inputs:
-        return None
+        return None, {}
 
-    normalized: dict[str, Any] = {}
     images = list(multimodal_inputs.get("images") or [])
-    if images:
-        from PIL import Image
-
-        from relax.utils.multimodal.image_utils import load_image
-
-        normalized_images = []
-        for image in images:
-            if image is None:
-                continue
-            if isinstance(image, Image.Image):
-                normalized_images.append(image)
-                continue
-            if isinstance(image, dict):
-                image_bytes = image.get("bytes")
-                image_path = image.get("path")
-                if isinstance(image_bytes, (bytes, bytearray)):
-                    normalized_images.append(load_image(bytes(image_bytes)))
-                    continue
-                if isinstance(image_path, str) and image_path:
-                    normalized_images.append(load_image(image_path))
-                    continue
-            normalized_images.append(load_image(image))
-        if normalized_images:
-            normalized["images"] = normalized_images
-
     videos = list(multimodal_inputs.get("videos") or [])
-    if videos:
-        normalized["videos"] = videos
-
     audio_items = list(multimodal_inputs.get("audio") or [])
-    if audio_items:
-        normalized["audio"] = audio_items
+    content = [
+        {"type": modality, modality: value}
+        for modality, values in (("image", images), ("video", videos), ("audio", audio_items))
+        for value in values
+        if value is not None
+    ]
+    if not content:
+        return None, {}
+    if processor is None:
+        raise RuntimeError("Agentic multimodal inputs require a processor loaded from the model checkpoint.")
+    from relax.utils.data.processing_utils import process_vision_info
 
-    return normalized or None
+    started_at = time.monotonic()
+    return process_vision_info(
+        [{"role": "user", "content": content}], processor, use_audio_in_video, multimodal_config
+    ), {"process_vision_info_elapsed_s": time.monotonic() - started_at}
 
 
 @dataclass
@@ -3147,6 +3289,7 @@ class SGLangMessageCompiler:
         processor_pool: Any | None = None,
         apply_chat_template_kwargs: dict[str, Any] | None = None,
         use_audio_in_video: bool = False,
+        multimodal_config: Any | None = None,
         cpu_executor: Any | None = None,
     ):
         self.tokenizer = tokenizer
@@ -3154,6 +3297,7 @@ class SGLangMessageCompiler:
         self.processor_pool = processor_pool
         self.apply_chat_template_kwargs = apply_chat_template_kwargs or {}
         self.use_audio_in_video = use_audio_in_video
+        self.multimodal_config = multimodal_config
         self.cpu_executor = cpu_executor
 
     @staticmethod
@@ -3172,13 +3316,9 @@ class SGLangMessageCompiler:
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None,
     ) -> str:
-        chat_template_kwargs = (
-            self.apply_chat_template_kwargs
-            if chat_template_kwargs is None
-            else normalize_template_kwargs(chat_template_kwargs)
-        )
+        chat_template_kwargs = chat_template_kwargs or {}
         return self.tokenizer.apply_chat_template(
-            check_messages(messages),
+            messages,
             tools=tools,
             tokenize=False,
             add_generation_prompt=True,
@@ -3187,14 +3327,14 @@ class SGLangMessageCompiler:
 
     def _build_prompt_sync(
         self,
-        normalized_messages: list[dict[str, Any]],
-        normalized_tools: list[dict[str, Any]] | None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None,
-    ) -> tuple[str, list[int], dict[str, float]]:
+    ) -> tuple[str, list[int], int, dict[str, float]]:
         template_started_at = time.monotonic()
         prompt_text = self._apply_chat_template(
-            normalized_messages,
-            tools=normalized_tools,
+            messages,
+            tools=tools,
             chat_template_kwargs=chat_template_kwargs,
         )
         template_elapsed_s = time.monotonic() - template_started_at
@@ -3205,6 +3345,7 @@ class SGLangMessageCompiler:
         return (
             prompt_text,
             backend_prompt_ids,
+            0,
             {
                 "apply_chat_template_elapsed_s": template_elapsed_s,
                 "tokenizer_encode_elapsed_s": tokenize_elapsed_s,
@@ -3213,26 +3354,22 @@ class SGLangMessageCompiler:
 
     def _build_observation_prompt_sync(
         self,
-        normalized_messages: list[dict[str, Any]],
-        normalized_tools: list[dict[str, Any]] | None,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None,
     ) -> tuple[str, list[int], int, dict[str, float]]:
-        chat_template_kwargs = (
-            self.apply_chat_template_kwargs
-            if chat_template_kwargs is None
-            else normalize_template_kwargs(chat_template_kwargs)
-        )
+        chat_template_kwargs = chat_template_kwargs or {}
         template_started_at = time.monotonic()
         dummy_prompt = self.tokenizer.apply_chat_template(
-            check_messages(_DUMMY_MESSAGES),
-            tools=normalized_tools,
+            _DUMMY_MESSAGES,
+            tools=tools,
             tokenize=False,
             add_generation_prompt=False,
             **chat_template_kwargs,
         ).rstrip("\n")
         formatted_prompt = self.tokenizer.apply_chat_template(
-            check_messages(_DUMMY_MESSAGES + normalized_messages),
-            tools=normalized_tools,
+            _DUMMY_MESSAGES + messages,
+            tools=tools,
             tokenize=False,
             add_generation_prompt=True,
             **chat_template_kwargs,
@@ -3254,23 +3391,6 @@ class SGLangMessageCompiler:
                 "tokenizer_encode_elapsed_s": tokenize_elapsed_s,
             },
         )
-
-    async def _compute_multimodal_inputs_async(
-        self,
-        normalized_messages: list[dict[str, Any]],
-    ) -> tuple[dict[str, Any], dict[str, float]]:
-        from relax.utils.data.processing_utils import process_vision_info
-
-        started_at = time.monotonic()
-        loop = asyncio.get_running_loop()
-        multimodal_inputs = await loop.run_in_executor(
-            self.cpu_executor,
-            process_vision_info,
-            normalized_messages,
-            self.processor,
-            self.use_audio_in_video,
-        )
-        return multimodal_inputs, {"process_vision_info_elapsed_s": time.monotonic() - started_at}
 
     async def _run_processor_async(
         self,
@@ -3390,44 +3510,48 @@ class SGLangMessageCompiler:
         audio_data = list(results[offset:])
         return image_data, audio_data, video_data, {"media_encode_elapsed_s": time.monotonic() - started_at}
 
-    async def encode_messages(
+    async def _encode_with_prompt_builder(
         self,
         messages: list[dict[str, Any]],
         *,
         tools: list[dict[str, Any]] | None,
         chat_template_kwargs: dict[str, Any] | None = None,
         multimodal_inputs: dict[str, Any] | None = None,
+        prompt_builder: Callable[
+            [list[dict[str, Any]], list[dict[str, Any]] | None, dict[str, Any] | None],
+            tuple[str, list[int], int, dict[str, float]],
+        ],
     ) -> EncodedMessages:
         total_started_at = time.monotonic()
-        normalized_messages = check_messages(messages)
-        normalized_tools = normalize_tools(tools)
         loop = asyncio.get_running_loop()
 
         prompt_future = loop.run_in_executor(
             self.cpu_executor,
-            self._build_prompt_sync,
-            normalized_messages,
-            normalized_tools,
+            prompt_builder,
+            messages,
+            tools,
             chat_template_kwargs,
         )
-        if self.processor and multimodal_inputs is None:
-            multimodal_future = asyncio.create_task(self._compute_multimodal_inputs_async(normalized_messages))
-        else:
-            multimodal_future = None
-        normalized_override_future = None
         if multimodal_inputs is not None:
-            normalized_override_future = loop.run_in_executor(
+            multimodal_future = loop.run_in_executor(
                 self.cpu_executor,
                 _normalize_multimodal_inputs_sync,
                 multimodal_inputs,
+                self.processor,
+                self.use_audio_in_video,
+                self.multimodal_config,
             )
-        prompt_text, backend_prompt_ids, prompt_timing = await prompt_future
+        else:
+            multimodal_future = None
+
+        prompt_text, backend_prompt_ids, trim_length, prompt_timing = await prompt_future
         multimodal_inputs = None
         multimodal_timing: dict[str, float] = {}
         if multimodal_future is not None:
             multimodal_inputs, multimodal_timing = await multimodal_future
-        elif normalized_override_future is not None:
-            multimodal_inputs = await normalized_override_future
+        has_media = multimodal_inputs is not None and any(
+            multimodal_inputs.get(key) for key in ("images", "videos", "audio")
+        )
 
         train_prompt_ids = list(backend_prompt_ids)
         multimodal_train_inputs = None
@@ -3439,9 +3563,11 @@ class SGLangMessageCompiler:
 
         processor_task = None
         media_task = None
-        if self.processor:
-            processor_task = asyncio.create_task(self._run_processor_async(prompt_text, multimodal_inputs or {}))
-        if multimodal_inputs:
+        if has_media:
+            processor_task = asyncio.create_task(
+                self._run_processor_async(prompt_text, multimodal_inputs or {}, trim_length=trim_length)
+            )
+        if has_media:
             media_task = asyncio.create_task(self._encode_media_async(multimodal_inputs))
 
         if processor_task is not None:
@@ -3459,6 +3585,22 @@ class SGLangMessageCompiler:
             backend_video_data=video_data,
             multimodal_train_inputs=multimodal_train_inputs,
             timing=timing,
+        )
+
+    async def encode_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None,
+        chat_template_kwargs: dict[str, Any] | None = None,
+        multimodal_inputs: dict[str, Any] | None = None,
+    ) -> EncodedMessages:
+        return await self._encode_with_prompt_builder(
+            messages,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            multimodal_inputs=multimodal_inputs,
+            prompt_builder=self._build_prompt_sync,
         )
 
     async def encode_observation_delta(
@@ -3469,70 +3611,12 @@ class SGLangMessageCompiler:
         chat_template_kwargs: dict[str, Any] | None = None,
         multimodal_inputs: dict[str, Any] | None = None,
     ) -> EncodedMessages:
-        total_started_at = time.monotonic()
-        normalized_messages = check_messages(messages_delta)
-        normalized_tools = normalize_tools(tools)
-        loop = asyncio.get_running_loop()
-
-        prompt_future = loop.run_in_executor(
-            self.cpu_executor,
-            self._build_observation_prompt_sync,
-            normalized_messages,
-            normalized_tools,
-            chat_template_kwargs,
-        )
-        if self.processor and multimodal_inputs is None:
-            multimodal_future = asyncio.create_task(self._compute_multimodal_inputs_async(normalized_messages))
-        else:
-            multimodal_future = None
-        normalized_override_future = None
-        if multimodal_inputs is not None:
-            normalized_override_future = loop.run_in_executor(
-                self.cpu_executor,
-                _normalize_multimodal_inputs_sync,
-                multimodal_inputs,
-            )
-
-        formatted_prompt, backend_prompt_ids, trim_length, prompt_timing = await prompt_future
-        multimodal_inputs = None
-        multimodal_timing: dict[str, float] = {}
-        if multimodal_future is not None:
-            multimodal_inputs, multimodal_timing = await multimodal_future
-        elif normalized_override_future is not None:
-            multimodal_inputs = await normalized_override_future
-
-        train_prompt_ids = list(backend_prompt_ids)
-        multimodal_train_inputs = None
-        processor_timing: dict[str, float] = {}
-        media_timing: dict[str, float] = {}
-        image_data: list[str] = []
-        audio_data: list[str] = []
-        video_data: list[str] = []
-
-        processor_task = None
-        media_task = None
-        if self.processor:
-            processor_task = asyncio.create_task(
-                self._run_processor_async(formatted_prompt, multimodal_inputs or {}, trim_length=trim_length)
-            )
-        if multimodal_inputs:
-            media_task = asyncio.create_task(self._encode_media_async(multimodal_inputs))
-
-        if processor_task is not None:
-            train_prompt_ids, multimodal_train_inputs, processor_timing = await processor_task
-        if media_task is not None:
-            image_data, audio_data, video_data, media_timing = await media_task
-
-        timing = self._merge_timing(prompt_timing, multimodal_timing, processor_timing, media_timing)
-        timing["total_elapsed_s"] = time.monotonic() - total_started_at
-        return EncodedMessages(
-            train_prompt_ids=train_prompt_ids,
-            backend_prompt_ids=backend_prompt_ids,
-            backend_image_data=image_data,
-            backend_audio_data=audio_data,
-            backend_video_data=video_data,
-            multimodal_train_inputs=multimodal_train_inputs,
-            timing=timing,
+        return await self._encode_with_prompt_builder(
+            messages_delta,
+            tools=tools,
+            chat_template_kwargs=chat_template_kwargs,
+            multimodal_inputs=multimodal_inputs,
+            prompt_builder=self._build_observation_prompt_sync,
         )
 
 
@@ -3617,6 +3701,7 @@ class SGLangBackendAdapter:
         self._apply_chat_template_kwargs = args.apply_chat_template_kwargs
         self._use_rollout_routing_replay = args.use_rollout_routing_replay
         self._router_policy = args.sglang_router_policy
+        self._slime_router_sticky = getattr(args, "slime_router_sticky", False)
         resources = compiler_resources or get_agentic_runtime_resources(args).compiler
         self.tokenizer = resources.tokenizer
         self.compiler = SGLangMessageCompiler(
@@ -3625,6 +3710,7 @@ class SGLangBackendAdapter:
             processor_pool=resources.processor_pool,
             apply_chat_template_kwargs=self._apply_chat_template_kwargs,
             use_audio_in_video=args.use_audio_in_video,
+            multimodal_config=MultimodalConfig.from_args(args),
             cpu_executor=resources.cpu_executor,
         )
 
@@ -3659,7 +3745,9 @@ class SGLangBackendAdapter:
         if video_data:
             payload["video_data"] = list(video_data)
         headers = None
-        if self._router_policy == "consistent_hashing" and session_id:
+        if session_id and (self._router_policy == "consistent_hashing" or self._slime_router_sticky):
+            # Pin every turn of a session to the same engine so the growing
+            # conversation prefix reuses that engine's KV cache across turns.
             headers = {"X-SMG-Routing-Key": session_id}
         url = f"http://{router_ip}:{router_port}/generate"
         started = time.time()

@@ -736,6 +736,30 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
 
+# In-process singleton set inside RolloutManager.__init__. Only meaningful
+# from code running inside the RolloutManager actor's own process (e.g., a
+# custom_reward_post_process function loaded there). Cross-process access
+# must go through the Ray handle.
+_LOCAL_ROLLOUT_MANAGER: "RolloutManager | None" = None
+
+
+def get_local_rollout_manager() -> "RolloutManager":
+    # Read via sys.modules to defend against the case where an importer of
+    # this module gets a different module-object namespace than the one
+    # RolloutManager.__init__ wrote into (cloudpickle can create parallel
+    # namespaces when materializing @ray.remote classes in workers).
+    import sys as _sys
+
+    mgr = getattr(_sys.modules[__name__], "_LOCAL_ROLLOUT_MANAGER", None)
+    if mgr is None:
+        raise RuntimeError(
+            "get_local_rollout_manager() called outside the RolloutManager "
+            "actor process, or before it finished __init__. "
+            f"module_id={id(_sys.modules[__name__])}, pid={os.getpid()}"
+        )
+    return mgr
+
+
 @ray.remote(
     concurrency_groups={
         "health_monitoring": 1,
@@ -756,6 +780,7 @@ class RolloutManager(ReloadableMixin):
     def __init__(self, args, pg, data_source=None):
         self.pg = pg
         self.args = args
+        self._dynamic_global_batch_size = None
 
         init_tracking(args, primary=False)
 
@@ -801,6 +826,19 @@ class RolloutManager(ReloadableMixin):
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
         self.status = None
+
+        # In-process singleton so user code running inside this actor (notably
+        # custom_reward_post_process_func loaded and invoked on the rollout
+        # actor's event loop) can call offload()/onload() directly without a
+        # self-remote call that would deadlock.
+        # We must write into sys.modules[__name__] explicitly: when Ray/cloudpickle
+        # reconstructs the @ray.remote class in the worker, __init__.__globals__
+        # can be a namespace distinct from sys.modules['relax.distributed.ray.rollout'],
+        # so a plain `global _LOCAL_ROLLOUT_MANAGER` write becomes invisible to
+        # any code that imports the module the normal way.
+        import sys as _sys
+
+        _sys.modules[__name__]._LOCAL_ROLLOUT_MANAGER = self
 
         # Elastic scale-out tracking
         self._scale_out_requests: dict[str, ScaleOutRequest] = {}
@@ -937,6 +975,17 @@ class RolloutManager(ReloadableMixin):
         """
         return self._weight_sync_lock
 
+    def get_dynamic_global_batch_size(self):
+        """Return the actual sample count from the last rollout step.
+
+        Used by training side to compute correct batch_size for TQ fetch when
+        use_dynamic_global_batch_size is enabled.
+        """
+        assert self._dynamic_global_batch_size is not None, (
+            "get_dynamic_global_batch_size called before first generate()"
+        )
+        return self._dynamic_global_batch_size
+
     def get_num_rollout_per_epoch(self):
         assert self.args.rollout_global_dataset
         return ray.get(self.data_source.lengths.remote()) // self.args.rollout_batch_size
@@ -946,7 +995,7 @@ class RolloutManager(ReloadableMixin):
         self.health_monitoring_resume()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
-        await asyncio.to_thread(
+        output = await asyncio.to_thread(
             call_rollout_fn,
             self.generate_rollout,
             self.args,
@@ -955,6 +1004,8 @@ class RolloutManager(ReloadableMixin):
             self.data_system_client,
             evaluation=False,
         )
+        if self.args.partial_rollout and self.args.use_dynamic_global_batch_size:
+            self._dynamic_global_batch_size = len(output.samples) * self.args.n_samples_per_prompt
 
     async def eval(self, rollout_id):
         self.health_monitoring_resume()
@@ -1065,14 +1116,31 @@ class RolloutManager(ReloadableMixin):
             logger.warning(f"Failed to load data source: {e}")
 
     async def offload(self):
+        self._offload_local()
+
+    def _offload_local(self):
+        """Sync body of offload(); safe to call directly from code running
+        inside this actor's process (e.g. custom_reward_post_process)."""
+        if self.status == "offload":
+            logger.info("Rollout already offloaded; skipping")
+            return
         self.health_monitoring_pause()
         for srv in self.servers.values():
             srv.offload()
         self.status = "offload"
 
     async def onload(self, tags: list[str] | None = None):
+        self._onload_local(tags)
+
+    def _onload_local(self, tags: list[str] | None = None):
+        """Sync body of onload(); safe to call directly from code running
+        inside this actor's process (e.g. custom_reward_post_process)."""
         for srv in self.servers.values():
             srv.onload(tags)
+        # Full onload transitions status; per-tag calls leave status for the
+        # dedicated wrappers below (onload_weights / onload_kv).
+        if tags is None:
+            self.status = "onload"
 
     async def onload_weights(self):
         await self.onload(tags=[GPU_MEMORY_TYPE_WEIGHTS])

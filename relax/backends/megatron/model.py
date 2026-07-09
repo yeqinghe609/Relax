@@ -26,7 +26,7 @@ from megatron.training.global_vars import get_args
 from megatron.training.training import get_model
 
 from relax.engine.sft.runtime import is_sft_mode
-from relax.utils import telemetry, tracking_utils
+from relax.utils import tracking_utils
 from relax.utils.data.stream_dataloader import StreamingTQIterator
 from relax.utils.logging_utils import get_logger
 from relax.utils.memory_utils import clear_memory
@@ -796,7 +796,8 @@ def train(
         num_microbatches (Sequence[int]): Microbatches per step in the rollout.
     """
     args = get_args()
-    if isinstance(data_iterator[0], DataIterator):
+    is_data_iterator = isinstance(data_iterator[0], DataIterator)
+    if is_data_iterator:
         for iterator in data_iterator:
             iterator.reset()
     else:
@@ -871,16 +872,25 @@ def train(
         pre_hook_enabled = False
 
     num_steps_per_rollout = len(num_microbatches)
+    use_step_iterators = (
+        not is_data_iterator and len(data_iterator) > 1 and isinstance(data_iterator[0], StreamingTQIterator)
+    )
+    if use_step_iterators and len(data_iterator) != num_steps_per_rollout:
+        raise ValueError(
+            f"streaming data_iterator length ({len(data_iterator)}) must match "
+            f"num_steps_per_rollout ({num_steps_per_rollout})"
+        )
 
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
+        step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
         # Run training step.
         with timer(f"train_micro_batch_{step_id}", keep=False):
             loss_dict, grad_norm = train_one_step(
                 args,
                 rollout_id,
                 step_id,
-                data_iterator,
+                step_data_iterator,
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1134,13 +1144,10 @@ def initialize_model_and_optimizer(
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
         logger.info("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
 
-    telemetry.mark("setup_begin", role=role)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(args, role)
-    telemetry.mark("setup_end", role=role)
     model[0].role = role
     reinit_critic_output_layer = _critic_output_layer_needs_reinit(args, model, role)
     clear_memory()
-    telemetry.mark("checkpoint_load_begin", role=role)
     iteration, _ = load_checkpoint(
         model,
         optimizer,
@@ -1148,7 +1155,6 @@ def initialize_model_and_optimizer(
         checkpointing_context={},
         skip_load_to_model_and_opt=False,
     )
-    telemetry.mark("checkpoint_load_end", role=role)
     if reinit_critic_output_layer:
         _reinitialize_critic_output_layer(model)
         if (args.fp16 or args.bf16) and optimizer is not None:
