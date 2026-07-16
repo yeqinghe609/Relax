@@ -267,6 +267,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Add margin for train memory allocation. By default we will reserve 1GB as margin.",
             )
             parser.add_argument(
+                "--manual-offload",
+                action="store_true",
+                default=False,
+                help=(
+                    "Offload the training actor to CPU during colocate sleep/wake via an explicit, "
+                    "application-level selective offload (weights + optimizer state) instead of "
+                    "torch_memory_saver. Default is torch_memory_saver; use this on backends where "
+                    "its VMM pause() is unavailable/unsafe (e.g. Kunlunxin P800)."
+                ),
+            )
+            parser.add_argument(
                 "--disable-weights-backuper",
                 action="store_false",
                 dest="enable_weights_backuper",
