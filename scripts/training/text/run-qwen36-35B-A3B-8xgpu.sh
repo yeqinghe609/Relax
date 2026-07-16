@@ -155,6 +155,7 @@ ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${HOST_IP}:8265" \
    --resource '{"actor": [1, 8], "rollout": [1, 8]}' \
    --colocate \
    --max-staleness 0 \
+   --manual-offload \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
    "${ROLLOUT_ARGS[@]}" \
