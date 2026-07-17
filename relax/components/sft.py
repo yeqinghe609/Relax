@@ -286,7 +286,7 @@ class SFT(Base):
                     f"partitions={partitions}); consumer likely dead. Raise "
                     f"--sft-tq-timeout-minutes if this is a slow consumer."
                 )
-            if wait_count % 10 == 0:
+            if wait_count % 60 == 0:
                 self._logger.info(
                     f"SFT producer step {self.step}: TQ buffer full "
                     f"(in_flight={in_flight}/{max_in_flight}, partitions={partitions}); waited {wait_count}s"
@@ -325,7 +325,7 @@ class SFT(Base):
             self.step += 1
             return
         self._maybe_print_first_sample(samples)
-        backend_batch = pack_samples_for_tq(samples)
+        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
         assert backend_batch is not None
         await self.data_system_client.async_put(
             data=dict_to_tensordict(backend_batch, batch_size=len(backend_batch["tokens"])),
@@ -392,7 +392,7 @@ class SFT(Base):
                 f"interpret with caution."
             )
 
-        backend_batch = pack_samples_for_tq(samples)
+        backend_batch = pack_samples_for_tq(samples, force_multimodal_field=self.config.multimodal_keys is not None)
         assert backend_batch is not None
         n_samples = len(backend_batch["tokens"])
 

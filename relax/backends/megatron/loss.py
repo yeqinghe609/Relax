@@ -543,7 +543,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     padded_total_lengths: list[int] | None = maybe_padded_total_lengths(
         total_lengths,
         args.qkv_format,
-        rollout_data.get("multimodal_train_inputs") is not None or getattr(args, "uses_unsplit_forward", False),
+        getattr(args, "is_vl_model", False)
+        or rollout_data.get("multimodal_train_inputs") is not None
+        or getattr(args, "uses_unsplit_forward", False),
     )
 
     # return when not the last pp stage.
@@ -1297,7 +1299,14 @@ def loss_function(
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
     if args.recompute_loss_function:
-        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean)
+        loss, log = checkpoint(
+            func,
+            args,
+            batch,
+            logits,
+            sum_of_sample_mean,
+            use_reentrant=getattr(args, "recompute_loss_function_use_reentrant", True),
+        )
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 
